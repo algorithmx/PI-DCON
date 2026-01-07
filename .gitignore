@@ -3,3 +3,7 @@ Main/__pycache__/
 *.mat
 *.png
 *.pkl
+.DS_Store
+.vscode/
+.idea/
+env/
