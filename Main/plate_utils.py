@@ -6,6 +6,12 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from train_utils import (
+    print_training_config,
+    setup_optimizer_and_loss,
+    try_load_pretrained_model,
+    validate_and_save_model_generic
+)
 
 
 # Physics-informed loss
@@ -78,83 +84,38 @@ def test(model, loader, coors, device, args):
     Ouput:
         A plot of the PDE solution ground-truth, prediction, and absolute error
     '''
+    from test_utils import (
+        prepare_test_coordinates,
+        run_test_loop,
+        create_test_visualization,
+        save_test_plot
+    )
 
     # split the coordinates
-    test_coor_x = coors[:, 0].unsqueeze(0).float().to(device)
-    test_coor_y = coors[:, 1].unsqueeze(0).float().to(device)
+    test_coor_x, test_coor_y = prepare_test_coordinates(coors, device)
 
-    mean_relative_L2 = 0
-    num = 0
-    max_relative_err = -1
-    min_relative_err = np.inf
-    for (par, u, v) in loader:
+    # define L2 error computation for plate stress
+    def compute_L2_error_plate(pred, out):
+        u_pred, v_pred = pred
+        u, v = out
+        return torch.sqrt(torch.sum((u_pred-u)**2 + (v_pred-v)**2, -1)) / \
+               torch.sqrt(torch.sum((u)**2 + (v)**2, -1))
 
-        # move the data to device
-        batch = par.shape[0]
-        par = par.float().to(device)
-        u = u.float().to(device)
-        v = v.float().to(device)
-
-        # model forward
-        u_pred, v_pred = model(test_coor_x.repeat(batch,1), test_coor_y.repeat(batch,1), par)
-        L2_relative = torch.sqrt(torch.sum((u_pred-u)**2 + (v_pred-v)**2, -1)) / torch.sqrt(torch.sum((u)**2 + (v)**2, -1))
-
-        # find the max and min error sample in this batch
-        max_err, max_err_idx = torch.topk(L2_relative, 1)
-        if max_err > max_relative_err:
-            max_relative_err = max_err
-            worst_f = u_pred[max_err_idx,:].detach().cpu().numpy()
-            worst_gt = u[max_err_idx,:].detach().cpu().numpy()
-        min_err, min_err_idx = torch.topk(-L2_relative, 1)
-        min_err = -min_err
-        if min_err < min_relative_err:
-            min_relative_err = min_err
-            best_f = u_pred[min_err_idx,:].detach().cpu().numpy()
-            best_gt = u[min_err_idx,:].detach().cpu().numpy()
-
-        # store mean relative error
-        mean_relative_L2 += torch.sum(L2_relative).detach().cpu().item()
-        num += u.shape[0]
-
-    mean_relative_L2 /= num
+    # run test loop
+    mean_relative_L2, tracking = run_test_loop(
+        model, loader, test_coor_x, test_coor_y, device,
+        compute_L2_error_plate, num_outputs=2
+    )
 
     # make the coordinates to numpy
     coor_x = test_coor_x[0].detach().cpu().numpy()
     coor_y = test_coor_y[0].detach().cpu().numpy()
 
-    # color bar range
-    max_color = np.amax([np.amax(worst_gt), np.amax(best_gt)])
-    min_color = np.amin([np.amin(worst_gt), np.amin(best_gt)])
+    # create visualization with larger scatter size for plate problem
+    create_test_visualization(coor_x, coor_y, tracking, scatter_size=20)
 
-    # make a plot
-    SS = 20
-    cm = plt.cm.get_cmap('RdYlBu')
-    plt.figure(figsize=(15,8), dpi=400)
-    plt.subplot(2,3,1)
-    plt.scatter(coor_x, coor_y, c=worst_f, cmap=cm, vmin=min_color, vmax=max_color, marker='o', s=SS)
-    plt.colorbar()
-    plt.title('Prediction (worst case)', fontsize=15)
-    plt.subplot(2,3,2)
-    plt.scatter(coor_x, coor_y, c=worst_gt, cmap=cm, vmin=min_color, vmax=max_color, marker='o', s=SS)
-    plt.title('Ground Truth (worst case)', fontsize=15)
-    plt.colorbar()
-    plt.subplot(2,3,3)
-    plt.scatter(coor_x, coor_y, c=np.abs(worst_f-worst_gt), cmap=cm, vmin=min_color, vmax=max_color, marker='o', s=SS)
-    plt.title('Absolute Error (worst case)', fontsize=15)
-    plt.colorbar()
-    plt.subplot(2,3,4)
-    plt.scatter(coor_x, coor_y, c=best_f, cmap=cm, vmin=min_color, vmax=max_color, marker='o', s=SS)
-    plt.colorbar()
-    plt.title('Prediction (best case)', fontsize=15)
-    plt.subplot(2,3,5)
-    plt.scatter(coor_x, coor_y, c=best_gt, cmap=cm, vmin=min_color, vmax=max_color, marker='o', s=SS)
-    plt.title('Ground Truth (best case)', fontsize=15)
-    plt.colorbar()
-    plt.subplot(2,3,6)
-    plt.scatter(coor_x, coor_y, c=np.abs(best_f-best_gt), cmap=cm, vmin=min_color, vmax=max_color, marker='o', s=SS)
-    plt.title('Absolute Error (best case)', fontsize=15)
-    plt.colorbar()
-    plt.savefig(r'../res/plots/sample_{}_{}.png'.format(args.model, args.data))
+    # save plot
+    save_test_plot(args)
 
     return mean_relative_L2
 
@@ -194,92 +155,202 @@ def val(model, loader, coors, device):
     return mean_relative_L2, abs_err
 
 
-# define the training function
-def train(args, config, model, device, loaders, coors, flag_BCxy, flag_BCy, flag_BC_load, params):
+def prepare_training_coordinates(coors, flag_BCxy, flag_BCy, flag_BC_load, device):
+    """
+    Prepare and organize different types of coordinates for training.
 
-    # print training configuration
-    print('training configuration')
-    print('batchsize:', config['train']['batchsize'])
-    print('coordinate sampling frequency:', config['train']['coor_sampling_freq'])
-    print('learning rate:', config['train']['base_lr'])
-    print('BC weight', config['train']['bc_weight'])
-
-    # get train and test loader
-    train_loader, val_loader, test_loader = loaders
-
-    # define model training configuration
-    pbar = range(config['train']['epochs'])
-    pbar = tqdm(pbar, dynamic_ncols=True, smoothing=0.1)
-
-    # extract coors
+    Returns:
+        dict: Dictionary containing organized coordinates for different boundary types
+    """
     xy_BC_coors = coors[np.where(flag_BCxy==1)[0],:]
     y_BC_coors = coors[np.where(flag_BCy==1)[0],:]
     load_BC_coors = coors[np.where(flag_BC_load==1)[0],:]
     pde_coors = coors[np.where(flag_BC_load+flag_BCxy+flag_BCy==0)[0],:]
     num_pde_nodes = pde_coors.shape[0]
 
-    # Move the data to device
+    # Move to device
     xy_BC_coors = xy_BC_coors.float().to(device)
     y_BC_coors = y_BC_coors.float().to(device)
     load_BC_coors = load_BC_coors.float().to(device)
     coors = coors.float().to(device)
+
     print('Number of PDE points:', num_pde_nodes)
 
-    # define optimizer and loss
-    mse = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=config['train']['base_lr'])
+    return {
+        'xy_BC': xy_BC_coors,
+        'y_BC': y_BC_coors,
+        'load_BC': load_BC_coors,
+        'pde': pde_coors,
+        'all': coors,
+        'num_pde_nodes': num_pde_nodes
+    }
 
-    # visual frequency for evaluation and store the updated model parameters
+
+def compute_all_losses(u_load_pred, v_load_pred, u_load_gt, v_load_gt,
+                      u_BCxy_pred, v_BCxy_pred, sigma_yy, sigma_xy,
+                      rx_pde, ry_pde, mse, weight_bc):
+    """
+    Compute all loss components for training.
+
+    Returns:
+        dict: Dictionary containing all loss components
+    """
+    bc_loss1 = mse(u_load_pred, u_load_gt)
+    bc_loss2 = mse(v_load_pred, v_load_gt)
+    bc_loss3 = torch.mean(u_BCxy_pred**2) + torch.mean(v_BCxy_pred**2)
+    bc_loss4 = torch.mean(sigma_yy**2) + torch.mean(sigma_xy**2)
+    pde_loss1 = torch.mean(rx_pde**2)
+    pde_loss2 = torch.mean(ry_pde**2)
+    total_loss = (bc_loss1 + bc_loss2 + bc_loss3 + bc_loss4) + (pde_loss1 + pde_loss2) * weight_bc
+
+    return {
+        'bc1': bc_loss1.detach().cpu().item(),
+        'bc2': bc_loss2.detach().cpu().item(),
+        'bc3': bc_loss3.detach().cpu().item(),
+        'bc4': bc_loss4.detach().cpu().item(),
+        'pde1': pde_loss1.detach().cpu().item(),
+        'pde2': pde_loss2.detach().cpu().item(),
+        'total': total_loss
+    }
+
+
+def sample_pde_coordinates(pde_coors, num_pde_nodes, pointwise_err, flags, config):
+    """
+    Sample PDE collocation points based on error probability.
+
+    Returns:
+        torch.Tensor: Sampled PDE coordinates
+    """
+    p_pde_sampling = pointwise_err[np.where(flags['BC_load']+flags['BCxy']+flags['BCy']==0)[0]]
+    p_pde_sampling = p_pde_sampling / np.sum(p_pde_sampling)
+
+    ss_index = np.random.choice(
+        np.arange(num_pde_nodes),
+        config['train']['coor_sampling_size'],
+        p=p_pde_sampling
+    )
+    return pde_coors[ss_index, :]
+
+
+def train_single_iteration(model, par, u, v, prepared_coords, params, mse, weight_bc,
+                          optimizer, pointwise_err, flags, config):
+    """
+    Perform a single training iteration with coordinate sampling.
+
+    Returns:
+        dict: Loss values for this iteration
+    """
+    device = par.device
+    batchsize = par.shape[0]
+
+    # Sample PDE coordinates
+    pde_sampled_coors = sample_pde_coordinates(
+        prepared_coords['pde'],
+        prepared_coords['num_pde_nodes'],
+        pointwise_err,
+        flags,
+        config
+    )
+    pde_sampled_coors = pde_sampled_coors.float().to(device)
+
+    # Prepare and repeat data for batch
+    par = par.float().to(device)
+    pde_sampled_coors_r = pde_sampled_coors.unsqueeze(0).repeat(batchsize, 1, 1)
+    xy_BC_coors_r = prepared_coords['xy_BC'].unsqueeze(0).repeat(batchsize, 1, 1)
+    y_BC_coors_r = prepared_coords['y_BC'].unsqueeze(0).repeat(batchsize, 1, 1)
+    load_BC_coors_r = prepared_coords['load_BC'].unsqueeze(0).repeat(batchsize, 1, 1)
+
+    # Forward pass on fixed boundary
+    u_BCxy_pred, v_BCxy_pred = model(xy_BC_coors_r[:, :, 0], xy_BC_coors_r[:, :, 1], par)
+
+    # Forward pass on free boundary
+    x_pde_bcy = Variable(y_BC_coors_r[:, :, 0], requires_grad=True)
+    y_pde_bcy = Variable(y_BC_coors_r[:, :, 1], requires_grad=True)
+    u_BCy_pred, v_BCy_pred = model(x_pde_bcy, y_pde_bcy, par)
+    sigma_yy, sigma_xy = bc_edgeY_loss(u_BCy_pred, v_BCy_pred, x_pde_bcy, y_pde_bcy, params)
+
+    # Forward pass on loading element
+    u_load_pred, v_load_pred = model(load_BC_coors_r[:, :, 0], load_BC_coors_r[:, :, 1], par)
+    u_load_gt = u[:, np.where(flags['BC_load']==1)[0]].float().to(device)
+    v_load_gt = v[:, np.where(flags['BC_load']==1)[0]].float().to(device)
+
+    # Forward pass on PDE interior
+    x_pde = Variable(pde_sampled_coors_r[:, :, 0], requires_grad=True)
+    y_pde = Variable(pde_sampled_coors_r[:, :, 1], requires_grad=True)
+    u_pde_pred, v_pde_pred = model(x_pde, y_pde, par)
+    rx_pde, ry_pde = struct_loss(u_pde_pred, v_pde_pred, x_pde, y_pde, params)
+
+    # Compute losses
+    losses = compute_all_losses(
+        u_load_pred, v_load_pred, u_load_gt, v_load_gt,
+        u_BCxy_pred, v_BCxy_pred, sigma_yy, sigma_xy,
+        rx_pde, ry_pde, mse, weight_bc
+    )
+
+    # Backward pass and optimization
+    optimizer.zero_grad()
+    losses['total'].backward()
+    optimizer.step()
+
+    return losses
+
+
+# define the training function
+def train(args, config, model, device, loaders, coors, flag_BCxy, flag_BCy, flag_BC_load, params):
+
+    # print training configuration
+    print_training_config(config)
+
+    # get train and test loader
+    train_loader, val_loader, test_loader = loaders
+
+    # setup training components
+    pbar = range(config['train']['epochs'])
+    pbar = tqdm(pbar, dynamic_ncols=True, smoothing=0.1)
+
+    # prepare coordinates
+    prepared_coords = prepare_training_coordinates(coors, flag_BCxy, flag_BCy, flag_BC_load, device)
+
+    # setup optimizer and loss
+    mse, optimizer = setup_optimizer_and_loss(config, model)
+
+    # visual frequency for evaluation
     vf = config['train']['visual_freq']
 
-    # move the model to the defined device
+    # move model to device
     model = model.to(device)
 
-    # initialize recored loss values
-    avg_loss1 = np.inf
-    avg_loss2 = np.inf
-    avg_loss3 = np.inf
-    avg_loss4 = np.inf
-    avg_loss5 = np.inf
-    avg_loss6 = np.inf
+    # initialize recorded loss values
+    avg_losses = {
+        'bc1': 0, 'bc2': 0, 'bc3': 0, 'bc4': 0,
+        'pde1': 0, 'pde2': 0
+    }
 
-    # try loading the pre-trained model
-    try:
-        model.load_state_dict(torch.load(r'../res/saved_models/best_model_{}_{}.pkl'.format(args.data, args.model), map_location=device))   
-    except:
-        print('No pre-trained model found.')
+    # try loading pre-trained model
+    try_load_pretrained_model(model, args, device)
 
-    # define the training weight
+    # define training weight
     weight_bc = config['train']['bc_weight']
+
+    # prepare flags dictionary
+    flags = {
+        'BC_load': flag_BC_load,
+        'BCxy': flag_BCxy,
+        'BCy': flag_BCy
+    }
 
     # start the training
     if args.phase == 'train':
         min_val_err = np.inf
-        for e in pbar:
-          
-            # show the performance improvement
-            if e % vf == 0:
-                model.eval()
-                err, pointwise_err = val(model, val_loader, coors, device)
+        pointwise_err = np.zeros(prepared_coords['all'].shape[0])
 
-                print('Best L2 relative error:', err)
-                print('x-direction prescribed displacement loss', avg_loss1)
-                print('y-direction prescribed displacement loss:', avg_loss2)
-                print('hole prescribed displacement loss', avg_loss3)
-                print('free boundary condtion loss:', avg_loss4)
-                print('x-direction PDE residual loss:', avg_loss5)
-                print('y-direction PDE residual loss:', avg_loss6) 
-                if err < min_val_err:
-                    torch.save(model.state_dict(), r'../res/saved_models/best_model_{}_{}.pkl'.format(args.data, args.model))
-                    min_val_err = err
-                
-                # update recored loss values
-                avg_loss1 = 0
-                avg_loss2 = 0
-                avg_loss3 = 0
-                avg_loss4 = 0
-                avg_loss5 = 0
-                avg_loss6 = 0
+        for e in pbar:
+
+            # validation and model saving
+            min_val_err, pointwise_err = validate_and_save_model_generic(
+                model, val_loader, prepared_coords['all'], device, args, e,
+                min_val_err, avg_losses, vf, val
+            )
 
             # train one epoch
             model.train()
@@ -287,66 +358,31 @@ def train(args, config, model, device, loaders, coors, flag_BCxy, flag_BCy, flag
 
                 for _ in range(config['train']['coor_sampling_freq']):
 
-                    # compute the sampling probability of each collocation point
-                    batchsize = u.shape[0]
-                    p_pde_sampling = pointwise_err[np.where(flag_BC_load+flag_BCxy+flag_BCy==0)[0]]
-                    p_pde_sampling = p_pde_sampling / np.sum(p_pde_sampling)
+                    # perform single training iteration
+                    losses = train_single_iteration(
+                        model, par, u, v, prepared_coords, params, mse, weight_bc,
+                        optimizer, pointwise_err, flags, config
+                    )
 
-                    ss_index = np.random.choice(np.arange(num_pde_nodes), config['train']['coor_sampling_size'], p=p_pde_sampling)
-                    pde_sampled_coors = pde_coors[ss_index, :]
-                    pde_sampled_coors = pde_sampled_coors.float().to(device)
+                    # accumulate losses
+                    avg_losses['bc1'] += losses['bc1']
+                    avg_losses['bc2'] += losses['bc2']
+                    avg_losses['bc3'] += losses['bc3']
+                    avg_losses['bc4'] += losses['bc4']
+                    avg_losses['pde1'] += losses['pde1']
+                    avg_losses['pde2'] += losses['pde2']
 
-                    # prepare the data
-                    par = par.float().to(device)
-                    pde_sampled_coors_r = pde_sampled_coors.unsqueeze(0).repeat(batchsize,1,1)
-                    xy_BC_coors_r = xy_BC_coors.unsqueeze(0).repeat(batchsize,1,1)
-                    y_BC_coors_r = y_BC_coors.unsqueeze(0).repeat(batchsize,1,1)
-                    load_BC_coors_r = load_BC_coors.unsqueeze(0).repeat(batchsize,1,1)
-
-                    # forward to get the prediction on fixed boundary
-                    u_BCxy_pred, v_BCxy_pred = model(xy_BC_coors_r[:,:,0], xy_BC_coors_r[:,:,1], par)
-
-                    # forward to get the prediction on free boundary
-                    x_pde_bcy = Variable(y_BC_coors_r[:,:,0], requires_grad=True)
-                    y_pde_bcy = Variable(y_BC_coors_r[:,:,1], requires_grad=True)
-                    u_BCy_pred, v_BCy_pred = model(x_pde_bcy, y_pde_bcy, par)
-                    sigma_yy, sigma_xy = bc_edgeY_loss(u_BCy_pred, v_BCy_pred, x_pde_bcy, y_pde_bcy, params)
-
-                    # forward to get the prediction on loading element
-                    u_load_pred, v_load_pred = model(load_BC_coors_r[:,:,0], load_BC_coors_r[:,:,1], par)
-                    u_load_gt = u[:,np.where(flag_BC_load==1)[0]].float().to(device)
-                    v_load_gt = v[:,np.where(flag_BC_load==1)[0]].float().to(device)
-
-                    # forward to get the prediction on pde inside element
-                    x_pde = Variable(pde_sampled_coors_r[:,:,0], requires_grad=True)
-                    y_pde = Variable(pde_sampled_coors_r[:,:,1], requires_grad=True)
-                    u_pde_pred, v_pde_pred = model(x_pde, y_pde, par)
-                    rx_pde, ry_pde = struct_loss(u_pde_pred, v_pde_pred, x_pde, y_pde, params)
-                    
-                    # compute the loss
-                    bc_loss1 = mse(u_load_pred, u_load_gt) 
-                    bc_loss2 = mse(v_load_pred, v_load_gt) 
-                    bc_loss3 = torch.mean(u_BCxy_pred**2) + torch.mean(v_BCxy_pred**2) 
-                    bc_loss4 = torch.mean(sigma_yy**2) + torch.mean(sigma_xy**2) 
-                    pde_loss1 = torch.mean(rx_pde**2)
-                    pde_loss2 = torch.mean(ry_pde**2) 
-                    total_loss = (bc_loss1 + bc_loss2 + bc_loss3 + bc_loss4) + (pde_loss1 + pde_loss2) * weight_bc
-
-                    # store the loss
-                    avg_loss1 += bc_loss1.detach().cpu().item()
-                    avg_loss2 += bc_loss2.detach().cpu().item()
-                    avg_loss3 += bc_loss3.detach().cpu().item()
-                    avg_loss4 += bc_loss4.detach().cpu().item()
-                    avg_loss5 += pde_loss1.detach().cpu().item()
-                    avg_loss6 += pde_loss2.detach().cpu().item()
-
-                    # update parameter
-                    optimizer.zero_grad()
-                    total_loss.backward()
-                    optimizer.step()
+            # Update progress bar with current losses
+            pbar.set_description(f'Epoch {e}')
+            pbar.set_postfix({
+                'PDE': f"{avg_losses['pde1'] + avg_losses['pde2']:.6f}",
+                'BC': f"{avg_losses['bc1'] + avg_losses['bc2'] + avg_losses['bc3'] + avg_losses['bc4']:.6f}"
+            })
 
     # final test
-    model.load_state_dict(torch.load(r'../res/saved_models/best_model_{}_{}.pkl'.format(args.data, args.model)))   
+    model.load_state_dict(torch.load(
+        r'../res/saved_models/best_model_{}_{}.pkl'.format(args.data, args.model)
+    ))
     model.eval()
-    err = test(model, test_loader, coors, device, args)
+    err = test(model, test_loader, prepared_coords['all'], device, args)
     print('Best L2 relative error on test loader:', err)

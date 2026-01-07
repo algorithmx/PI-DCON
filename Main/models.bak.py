@@ -128,7 +128,7 @@ class DCON_darcy(nn.Module):
         self.FC1u = nn.Linear(2, config['model']['fc_dim'])
         self.FC2u = nn.Linear(config['model']['fc_dim'], config['model']['fc_dim'])
         self.FC3u = nn.Linear(config['model']['fc_dim'], config['model']['fc_dim'])
-        self.FC4u = nn.Linear(config['model']['fc_dim'], 1)
+        self.FC4u = nn.Linear(config['model']['fc_dim'], 1) # unused?
         self.act = nn.Tanh()
         
     def forward(self, x_coor, y_coor, par):
@@ -246,17 +246,16 @@ class DeepONet_plate(nn.Module):
         model output:
             u (B, M): PDE solution fucntion values over the whole domain
         '''
-        
-        # PDE parameter encoding
-        enc1 = self.branch1(par[:,:,-1])    
-        enc2 = self.branch2(par[:,:,-1])    
-
         # PDE solution prediction
         xy = torch.cat((x_coor.unsqueeze(-1), y_coor.unsqueeze(-1)), -1)
-        ux = self.trunk1(xy)   
-        uy = self.trunk2(xy)   
-        u = torch.einsum('bij,bj->bi', ux, enc1)   
-        v = torch.einsum('bij,bj->bi', uy, enc2)     
+        # component 1
+        ux = self.trunk1(xy)
+        enc1 = self.branch1(par[:,:,-1]) # PDE parameter encoding
+        u = torch.einsum('bij,bj->bi', ux, enc1)
+        # component 2
+        uy = self.trunk2(xy)
+        enc2 = self.branch2(par[:,:,-1]) # PDE parameter encoding
+        v = torch.einsum('bij,bj->bi', uy, enc2)
 
         return u, v
 
@@ -302,7 +301,7 @@ class Improved_DeepONet_plate(nn.Module):
 
         # get the embeddings
         par_emb = self.be(par[...,-1]).unsqueeze(1)   # (B,1,F)
-        coor_emb = self.ce(xy)   # (B, M, F)
+        coor_emb = self.ce(xy)  # (B, M, F)
 
         # paramter forward
         enc = self.FC1b(par[...,-1]).unsqueeze(1)   # (B,F)

@@ -5,6 +5,12 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import torch
 import numpy as np
+from train_utils import (
+    print_training_config,
+    setup_optimizer_and_loss,
+    try_load_pretrained_model,
+    validate_and_save_model_generic
+)
 
 # Define physics-informed loss loss
 def darcy_loss(u, x_coor, y_coor):
@@ -47,82 +53,35 @@ def test(model, loader, coors, device, args):
     Ouput:
         A plot of the PDE solution ground-truth, prediction, and absolute error
     '''
+    from test_utils import (
+        prepare_test_coordinates,
+        run_test_loop,
+        create_test_visualization,
+        save_test_plot
+    )
 
     # split the coordinate into (x,y)
-    test_coor_x = coors[:, 0].unsqueeze(0).float().to(device)
-    test_coor_y = coors[:, 1].unsqueeze(0).float().to(device)
+    test_coor_x, test_coor_y = prepare_test_coordinates(coors, device)
 
-    # model testing
-    mean_relative_L2 = 0
-    num = 0
-    max_relative_err = -1
-    min_relative_err = np.inf
-    for (par, out) in loader:
+    # define L2 error computation for Darcy flow
+    def compute_L2_error_darcy(pred, out):
+        return (torch.norm(pred - out, dim=-1) / torch.norm(out, dim=-1))
 
-        # move the batch data to device
-        batch = par.shape[0]
-        par = par.float().to(device)
-        out = out.float().to(device)
-
-        # model forward
-        pred = model(test_coor_x.repeat(batch,1), test_coor_y.repeat(batch,1), par)
-        L2_relative = (torch.norm(pred-out, dim=-1) / torch.norm(out, dim=-1))
-
-        # find the max and min error sample in this batch
-        max_err, max_err_idx = torch.topk(L2_relative, 1)
-        if max_err > max_relative_err:
-            max_relative_err = max_err
-            worst_f = pred[max_err_idx,:].detach().cpu().numpy()
-            worst_gt = out[max_err_idx,:].detach().cpu().numpy()
-        min_err, min_err_idx = torch.topk(-L2_relative, 1)
-        min_err = -min_err
-        if min_err < min_relative_err:
-            min_relative_err = min_err
-            best_f = pred[min_err_idx,:].detach().cpu().numpy()
-            best_gt = out[min_err_idx,:].detach().cpu().numpy()
-
-        # compute average error
-        mean_relative_L2 += torch.sum(L2_relative).detach().cpu().item()
-        num += par.shape[0]
-
-    mean_relative_L2 /= num
+    # run test loop
+    mean_relative_L2, tracking = run_test_loop(
+        model, loader, test_coor_x, test_coor_y, device,
+        compute_L2_error_darcy, num_outputs=1
+    )
 
     # make the coordinates to numpy
     coor_x = test_coor_x[0].detach().cpu().numpy()
     coor_y = test_coor_y[0].detach().cpu().numpy()
 
-    # compute appropriate color bar range
-    max_color = np.amax([np.amax(worst_gt), np.amax(best_gt)])
-    min_color = np.amin([np.amin(worst_gt), np.amin(best_gt)])
+    # create visualization
+    create_test_visualization(coor_x, coor_y, tracking, scatter_size=5)
 
-    # make a plot
-    cm = plt.cm.get_cmap('RdYlBu')
-    plt.figure(figsize=(15,8), dpi=400)
-    plt.subplot(2,3,1)
-    plt.scatter(coor_x, coor_y, c=worst_f, cmap=cm, vmin=min_color, vmax=max_color, marker='o', s=5)
-    plt.colorbar()
-    plt.title('Prediction (worst case)', fontsize=15)
-    plt.subplot(2,3,2)
-    plt.scatter(coor_x, coor_y, c=worst_gt, cmap=cm, vmin=min_color, vmax=max_color, marker='o', s=5)
-    plt.title('Ground Truth (worst case)', fontsize=15)
-    plt.colorbar()
-    plt.subplot(2,3,3)
-    plt.scatter(coor_x, coor_y, c=np.abs(worst_f-worst_gt), cmap=cm, vmin=0, vmax=max_color, marker='o', s=5)
-    plt.title('Absolute Error (worst case)', fontsize=15)
-    plt.colorbar()
-    plt.subplot(2,3,4)
-    plt.scatter(coor_x, coor_y, c=best_f, cmap=cm, vmin=min_color, vmax=max_color, marker='o', s=5)
-    plt.colorbar()
-    plt.title('Prediction (best case)', fontsize=15)
-    plt.subplot(2,3,5)
-    plt.scatter(coor_x, coor_y, c=best_gt, cmap=cm, vmin=min_color, vmax=max_color, marker='o', s=5)
-    plt.title('Ground Truth (best case)', fontsize=15)
-    plt.colorbar()
-    plt.subplot(2,3,6)
-    plt.scatter(coor_x, coor_y, c=np.abs(best_f-best_gt), cmap=cm, vmin=0, vmax=max_color, marker='o', s=5)
-    plt.title('Absolute Error (best case)', fontsize=15)
-    plt.colorbar()
-    plt.savefig(r'../res/plots/sample_{}_{}.png'.format(args.model, args.data))
+    # save plot
+    save_test_plot(args)
 
     return mean_relative_L2
 
@@ -163,6 +122,84 @@ def val(model, loader, coors, device):
 
     return mean_relative_L2
 
+def prepare_darcy_coordinates(coors, BC_flags, device):
+    """
+    Prepare and organize coordinates for Darcy flow training.
+
+    Returns:
+        dict: Dictionary containing organized coordinates
+    """
+    BC_coors = coors[np.where(BC_flags==1)[0], :].float().to(device)
+    pde_coors = coors[np.where(BC_flags==0)[0], :]
+    num_pde_nodes = pde_coors.shape[0]
+
+    return {
+        'BC': BC_coors,
+        'pde': pde_coors,
+        'num_pde_nodes': num_pde_nodes
+    }
+
+
+def sample_pde_coordinates_darcy(pde_coors, num_pde_nodes, sampling_size):
+    """
+    Sample PDE collocation points for Darcy flow (uniform sampling).
+
+    Returns:
+        torch.Tensor: Sampled PDE coordinates
+    """
+    ss_index = np.random.randint(0, num_pde_nodes, sampling_size)
+    return pde_coors[ss_index, :]
+
+
+def train_single_iteration_darcy(model, par, out, prepared_coords, BC_flags, mse,
+                                 bc_weight, optimizer, device, coor_sampling_size):
+    """
+    Perform a single training iteration for Darcy flow.
+
+    Returns:
+        dict: Loss values for this iteration
+    """
+    # Sample PDE coordinates
+    pde_sampled_coors = sample_pde_coordinates_darcy(
+        prepared_coords['pde'],
+        prepared_coords['num_pde_nodes'],
+        coor_sampling_size
+    )
+
+    # Prepare data
+    batch = par.shape[0]
+    par = par.float().to(device)
+    BC_gt = out[:, np.where(BC_flags==1)[0]].float().to(device)
+    pde_sampled_coors_r = pde_sampled_coors.unsqueeze(0).repeat(batch, 1, 1).float().to(device)
+    bc_sampled_coors_r = prepared_coords['BC'].unsqueeze(0).repeat(batch, 1, 1).float().to(device)
+
+    # Forward pass for BC prediction
+    BC_pred = model(bc_sampled_coors_r[:, :, 0], bc_sampled_coors_r[:, :, 1], par)
+
+    # Define differentiable variables for PDE
+    sampled_x_coors = Variable(pde_sampled_coors_r[:, :, 0].type(torch.FloatTensor), requires_grad=True).to(device)
+    sampled_y_coors = Variable(pde_sampled_coors_r[:, :, 1].type(torch.FloatTensor), requires_grad=True).to(device)
+
+    # Forward pass for PDE
+    u_pred = model(sampled_x_coors, sampled_y_coors, par)
+
+    # Compute losses
+    pde_loss = darcy_loss(u_pred, sampled_x_coors, sampled_y_coors)
+    bc_loss = mse(BC_pred, BC_gt)
+    total_loss = pde_loss + bc_weight * bc_loss
+
+    # Backward pass and optimization
+    optimizer.zero_grad()
+    total_loss.backward()
+    optimizer.step()
+
+    return {
+        'pde': pde_loss.detach().cpu().item(),
+        'bc': bc_loss.detach().cpu().item(),
+        'total': total_loss
+    }
+
+
 # define the function for model training
 def train(args, config, model, device, loaders, coors, BC_flags):
     '''
@@ -179,65 +216,50 @@ def train(args, config, model, device, loaders, coors, BC_flags):
     '''
 
     # print training configuration
-    print('training configuration')
-    print('batchsize:', config['train']['batchsize'])
-    print('coordinate sampling frequency:', config['train']['coor_sampling_freq'])
-    print('learning rate:', config['train']['base_lr'])
-    print('BC weight', config['train']['bc_weight'])
+    print_training_config(config)
 
     # get train and test loader
     train_loader, val_loader, test_loader = loaders
 
-    # define model training configuration
+    # setup training components
     pbar = range(config['train']['epochs'])
     pbar = tqdm(pbar, dynamic_ncols=True, smoothing=0.1)
 
-    # extract coors
-    BC_coors = coors[np.where(BC_flags==1)[0],:].float().to(device)
-    pde_coors = coors[np.where(BC_flags==0)[0],:]
-    num_pde_nodes = pde_coors.shape[0]
+    # prepare coordinates
+    prepared_coords = prepare_darcy_coordinates(coors, BC_flags, device)
 
-    # define optimizer
-    optimizer = optim.Adam(model.parameters(), lr=config['train']['base_lr'])
+    # setup optimizer and loss
+    mse, optimizer = setup_optimizer_and_loss(config, model)
 
-    # define loss
-    mse = nn.MSELoss()
-
-    # visual frequency, define the number of epoch for each evaluation
+    # visual frequency for evaluation
     vf = config['train']['visual_freq']
 
-    # store the train loss
-    pde_avg_loss = np.inf
-    bc_avg_loss = np.inf
-
-    # move the model to the defined device
+    # move model to device
     model = model.to(device)
 
-    # try loading the pre-trained model
-    try:
-        model.load_state_dict(torch.load(r'../res/saved_models/best_model_{}_{}.pkl'.format(args.data, args.model), map_location=device))   
-    except:
-        print('No pre-trained model found.')
+    # initialize recorded loss values
+    avg_losses = {
+        'pde': 0,
+        'bc': 0
+    }
+
+    # try loading pre-trained model
+    try_load_pretrained_model(model, args, device)
+
+    # define training weight
+    bc_weight = config['train']['bc_weight']
 
     # start the training
     if args.phase == 'train':
         min_val_err = np.inf
-        for e in pbar:
-            
-            # show the performance improvement
-            if e % vf == 0:
-                model.eval()
-                err = val(model, val_loader, coors, device)
-                print('Best L2 relative error:', err)
-                print('current period pde loss:', pde_avg_loss/vf)
-                print('current period bc loss:', bc_avg_loss/vf)
-                pde_avg_loss = 0
-                bc_avg_loss = 0
 
-                # save the model if new lowest validation err is seen
-                if err < min_val_err:
-                    torch.save(model.state_dict(), r'../res/saved_models/best_model_{}_{}.pkl'.format(args.data, args.model))
-                    min_val_err = err
+        for e in pbar:
+
+            # validation and model saving
+            min_val_err, _ = validate_and_save_model_generic(
+                model, val_loader, coors, device, args, e,
+                min_val_err, avg_losses, vf, val
+            )
 
             # train one epoch
             model.train()
@@ -245,44 +267,27 @@ def train(args, config, model, device, loaders, coors, BC_flags):
 
                 for _ in range(config['train']['coor_sampling_freq']):
 
-                    # training with sampled coordinates
-                    ss_index = np.random.randint(0, num_pde_nodes, config['train']['coor_sampling_size'])
-                    pde_sampled_coors = pde_coors[ss_index, :]
+                    # perform single training iteration
+                    losses = train_single_iteration_darcy(
+                        model, par, out, prepared_coords, BC_flags, mse,
+                        bc_weight, optimizer, device, config['train']['coor_sampling_size']
+                    )
 
-                    # prepare data
-                    batch = par.shape[0]
-                    par = par.float().to(device)
-                    BC_gt = out[:, np.where(BC_flags==1)[0]].float().to(device)
-                    pde_sampled_coors_r = pde_sampled_coors.unsqueeze(0).repeat(batch, 1, 1).float().to(device)
-                    bc_sampled_coors_r = BC_coors.unsqueeze(0).repeat(batch, 1, 1).float().to(device)
+                    # accumulate losses
+                    avg_losses['pde'] += losses['pde']
+                    avg_losses['bc'] += losses['bc']
 
-                    # forward to get the BC prediction
-                    BC_pred = model(bc_sampled_coors_r[:,:,0], bc_sampled_coors_r[:,:,1], par)
+            # Update progress bar with current losses
+            pbar.set_description(f'Epoch {e}')
+            pbar.set_postfix({
+                'PDE': f"{avg_losses['pde']:.6f}",
+                'BC': f"{avg_losses['bc']:.6f}"
+            })
 
-                    # define the differentiable variables
-                    sampled_x_coors = Variable(pde_sampled_coors_r[:,:,0].type(torch.FloatTensor), requires_grad=True).to(device)
-                    sampled_y_coors = Variable(pde_sampled_coors_r[:,:,1].type(torch.FloatTensor), requires_grad=True).to(device)
-
-                    # model forward
-                    u_pred = model(sampled_x_coors, sampled_y_coors, par)
-
-                    # compute the loss
-                    pde_loss = darcy_loss(u_pred, sampled_x_coors, sampled_y_coors)
-                    bc_loss = mse(BC_pred, BC_gt)
-
-                    total_loss = pde_loss + config['train']['bc_weight'] * bc_loss
-
-                    # store the loss
-                    pde_avg_loss += pde_loss.detach().cpu().item()
-                    bc_avg_loss += bc_loss.detach().cpu().item()
-
-                    # update parameters
-                    optimizer.zero_grad()
-                    total_loss.backward()
-                    optimizer.step()
-
-    # final model test
-    model.load_state_dict(torch.load(r'../res/saved_models/best_model_{}_{}.pkl'.format(args.data, args.model)))   
+    # final test
+    model.load_state_dict(torch.load(
+        r'../res/saved_models/best_model_{}_{}.pkl'.format(args.data, args.model)
+    ))
     model.eval()
     err = test(model, test_loader, coors, device, args)
     print('Best L2 relative error on test loader:', err)

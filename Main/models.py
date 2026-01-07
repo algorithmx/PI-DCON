@@ -1,21 +1,29 @@
 import torch
 import torch.nn as nn
+from collections import OrderedDict
 
 '''
-Neural operator models for 2D Darcy flow and plate stress problems
-Refactored with class hierarchy to reduce code duplication
+Neural operator models for 2D Darcy flow and plate problems.
+
+- Darcy: predicts a scalar field u(x, y)
+- Plate: predicts a 2-component vector field (u(x, y), v(x, y))
+
+Refactored with class hierarchy to reduce code duplication.
 '''
 
 # ============================================================================
 # Utility Functions
 # ============================================================================
 
-def build_fc_block(in_dim, out_dim, activation=nn.Tanh()):
-    """Build a single fully-connected block with activation"""
-    return [nn.Linear(in_dim, out_dim), activation]
-
-
-def build_mlp(in_dim, fc_dim, n_layers, out_dim=None, activation=nn.Tanh()):
+def build_mlp(
+    in_dim,
+    fc_dim,
+    n_layers,
+    out_dim=None,
+    activation=nn.Tanh,
+    include_output_layer=True,
+    hidden_block="linear",
+):
     """
     Build a multi-layer perceptron
 
@@ -24,31 +32,61 @@ def build_mlp(in_dim, fc_dim, n_layers, out_dim=None, activation=nn.Tanh()):
         fc_dim: Hidden layer dimension
         n_layers: Number of layers
         out_dim: Output dimension (defaults to fc_dim if None)
-        activation: Activation function
+        activation: Activation module class (e.g. nn.Tanh)
+        include_output_layer: If True, append final Linear(fc_dim -> out_dim)
+                hidden_block: "linear" (default) or "ff".
+                        - "linear": hidden layers are Linear(fc_dim, fc_dim) + activation()
+                        - "ff": hidden layers are a single module with submodules named "ff" and "act"
+                            to match the original `models.bak.py` plate `fc` block state_dict keys.
 
     Returns:
         List of layers suitable for nn.Sequential
     """
+    if n_layers <= 0:
+        raise ValueError(f"n_layers must be >= 1, got {n_layers}")
     if out_dim is None:
         out_dim = fc_dim
 
-    layers = build_fc_block(in_dim, fc_dim, activation)
+    layers = [nn.Linear(in_dim, fc_dim), activation()]
     for _ in range(n_layers - 1):
-        layers.extend(build_fc_block(fc_dim, fc_dim, activation))
-    layers.append(nn.Linear(fc_dim, out_dim))
+        if hidden_block == "linear":
+            layers.extend([nn.Linear(fc_dim, fc_dim), activation()])
+        elif hidden_block == "ff":
+            layers.append(
+                nn.Sequential(
+                    OrderedDict(
+                        [
+                            ("ff", nn.Linear(fc_dim, fc_dim)),
+                            ("act", activation()),
+                        ]
+                    )
+                )
+            )
+        else:
+            raise ValueError(f"hidden_block must be 'linear' or 'ff', got {hidden_block!r}")
+    if include_output_layer:
+        layers.append(nn.Linear(fc_dim, out_dim))
 
     return layers
 
 
-class fc(nn.Module):
-    """FC layer wrapper used in plate models"""
-    def __init__(self, dim):
-        super().__init__()
-        self.ff = nn.Linear(dim, dim)
-        self.act = nn.Tanh()
-
-    def forward(self, x):
-        return self.act(self.ff(x))
+def build_sequential_layers(in_dim, hidden_dim, n_layers):
+    """
+    Build a sequence of Linear layers for manual modulation networks.
+    Returns individual layers as a list [FC1, FC2, FC3, ...]
+    
+    Args:
+        in_dim: Input dimension
+        hidden_dim: Hidden layer dimension
+        n_layers: Number of layers (typically 3)
+    
+    Returns:
+        List of nn.Linear layers
+    """
+    layers = [nn.Linear(in_dim, hidden_dim)]
+    for _ in range(n_layers - 1):
+        layers.append(nn.Linear(hidden_dim, hidden_dim))
+    return layers
 
 
 # ============================================================================
@@ -69,71 +107,209 @@ class BaseDeepONet(BaseNeuralOperator):
     Base class for DeepONet architecture.
     Shared logic for both Darcy and Plate problems.
     """
-    def __init__(self, config, input_dim):
+    def __init__(self, field_dim, config, input_dim, hidden_block="linear"):
         super().__init__(config)
 
         # Branch network - encodes boundary condition function values
-        branch_layers = build_mlp(input_dim, self.fc_dim, self.n_layer, self.fc_dim)
-        self.branch = nn.Sequential(*branch_layers)
-
+        branches = []
         # Trunk network - encodes spatial coordinates
-        trunk_layers = build_mlp(2, self.fc_dim, self.n_layer, self.fc_dim)
-        self.trunk = nn.Sequential(*trunk_layers)
+        trunks = []
+        for _ in range(field_dim):
+            branch_layers = build_mlp(input_dim, self.fc_dim, self.n_layer, self.fc_dim, hidden_block=hidden_block)
+            branches.append(nn.Sequential(*branch_layers))
+            trunk_layers = build_mlp(2, self.fc_dim, self.n_layer, self.fc_dim, hidden_block=hidden_block)
+            trunks.append(nn.Sequential(*trunk_layers))
+        self.branch = nn.ModuleList(branches)
+        self.trunk = nn.ModuleList(trunks)
+    
+    def _zip(self, xy, par, axis):
+        # Only extract the function values information to represent the PDE parameters
+        enc = self.branch[axis](par[...,-1])
+        # Compute the PDE solution prediction
+        x = self.trunk[axis](xy)    # (B,M,F)
+        # zip
+        u = torch.einsum('bij,bj->bi', x, enc)
+        return u
 
 
-class BaseImprovedDeepONet(BaseNeuralOperator):
+class BlendMixin:
+    """Shared primitives for mix-in based forward helpers."""
+
+    def _linear_act(self, linear, x):
+        x = linear(x)
+        x = self.act(x)
+        return x
+
+
+class ImprovedBlendMixin(BlendMixin):
+    """Shared forward helpers for Improved DeepONet-style embedding interpolation."""
+
+    @staticmethod
+    def _blend(par_emb, coor_emb, gate):
+        return (1 - gate) * par_emb + gate * coor_emb
+
+    def _linear_act_blend(self, linear, x, par_emb, coor_emb):
+        gate = self._linear_act(linear, x)
+        return self._blend(par_emb, coor_emb, gate)
+
+    def _predict_head(self, x, par_emb, coor_emb, fc1, fc2, fc3):
+        x = self._linear_act_blend(fc1, x, par_emb, coor_emb)
+        x = self._linear_act_blend(fc2, x, par_emb, coor_emb)
+        x = fc3(x)
+        return x
+
+
+class BaseImprovedDeepONet(ImprovedBlendMixin, BaseNeuralOperator):
     """
     Base class for Improved DeepONet with embedding modulation.
     Shared logic for both Darcy and Plate problems.
     """
-    def __init__(self, config, input_dim):
+    def __init__(self, field_dim, config, input_dim):
         super().__init__(config)
+        if field_dim not in (1, 2):
+            raise ValueError(f"field_dim must be 1 or 2, got {field_dim}")
 
-        # Branch network layers
-        self.FC1b = nn.Linear(input_dim, self.fc_dim)
-        self.FC2b = nn.Linear(self.fc_dim, self.fc_dim)
-        self.FC3b = nn.Linear(self.fc_dim, self.fc_dim)
-
-        # Trunk network layers
-        self.FC1c = nn.Linear(2, self.fc_dim)
-        self.FC2c = nn.Linear(self.fc_dim, self.fc_dim)
-        self.FC3c = nn.Linear(self.fc_dim, self.fc_dim)
+        # Branch network layers (3 layers for modulation)
+        branch_layers = build_sequential_layers(input_dim, self.fc_dim, 3)
+        self.FC1b, self.FC2b, self.FC3b = branch_layers
 
         # Embedding networks
-        self.be = nn.Sequential(nn.Linear(input_dim, self.fc_dim), nn.Tanh())
-        self.ce = nn.Sequential(nn.Linear(2, self.fc_dim), nn.Tanh())
+        self.be = nn.Sequential(*build_mlp(input_dim, self.fc_dim, 1, include_output_layer=False))
+        self.ce = nn.Sequential(*build_mlp(2, self.fc_dim, 1, include_output_layer=False))
+
+        # Trunk network layers (3 layers for coordinate encoding)
+        # Use ModuleList to ensure parameters are registered
+        self.FC = nn.ModuleList([
+            nn.ModuleList(build_sequential_layers(2, self.fc_dim, 3))
+            for _ in range(field_dim)
+        ])
 
         # Activation
         self.act = nn.Tanh()
 
+    def _encode_par(self, par_val, par_emb, coor_emb):
+        """Compute the parameter encoding (shared across all field components).
 
-class BaseDCON(BaseNeuralOperator):
+        Args:
+            par_val: Parameter function values (B, 1) for encoding
+            par_emb: Parameter embedding (B, 1, F)
+            coor_emb: Coordinate embedding (B, 1, F) - note: uses (B,1,F) from par_emb shape
+
+        Returns:
+            Parameter encoding (B, 1, F)
+        """
+        return self._predict_head(par_val, par_emb, coor_emb, self.FC1b, self.FC2b, self.FC3b)
+
+    def _predict_trunk(self, xy, par_emb, coor_emb, axis):
+        """Predict one field component using the trunk network at given axis."""
+        fc1, fc2, fc3 = self.FC[axis]
+        return self._predict_head(xy, par_emb, coor_emb, fc1, fc2, fc3)
+
+    def _zip(self, xy, par_val, par_emb, coor_emb, axis, enc=None):
+        """Combine trunk output with parameter encoding at given axis.
+
+        Args:
+            xy: Concatenated coordinates (B, M, 2)
+            par_val: Parameter function values (B, 1) for encoding
+            par_emb: Parameter embedding (B, 1, F)
+            coor_emb: Coordinate embedding (B, M, F)
+            axis: Field component index
+            enc: Pre-computed parameter encoding (optional). If None, will be computed.
+
+        Returns:
+            Field component values (B, M)
+        """
+        if enc is None:
+            enc = self._encode_par(par_val, par_emb, coor_emb)
+        # Coordinate forward
+        xy = self._predict_trunk(xy, par_emb, coor_emb, axis)
+        # Combine
+        return torch.sum(xy * enc, -1)
+
+
+class DCONBlendMixin(BlendMixin):
+    """Shared forward helpers for DCON-style gated modulation."""
+
+    @staticmethod
+    def _blend(x, enc):
+        return x * enc
+
+    def _linear_act_blend(self, linear, x, enc):
+        x = self._linear_act(linear, x)
+        return self._blend(x, enc)
+
+    def _predict_head(self, inp, enc, fc1, fc2, fc3):
+        x = self._linear_act_blend(fc1, inp, enc)
+        x = self._linear_act_blend(fc2, x, enc)
+        x = fc3(x)
+        return torch.mean(self._blend(x, enc), -1)
+
+
+class BaseDCON(DCONBlendMixin, BaseNeuralOperator):
     """
     Base class for DCON architecture with max-pooling and gated modulation.
     Shared logic for both Darcy and Plate problems.
     """
-    def __init__(self, config):
+    def __init__(
+        self,
+        field_dim,
+        config
+    ):
         super().__init__(config)
+        if field_dim not in (1, 2):
+            raise ValueError(f"field_dim must be 1 or 2, got {field_dim}")
 
-        # Branch network - processes (x, y, u) tuples
-        branch_layers = build_mlp(3, self.fc_dim, self.n_layer, self.fc_dim)
-        self.branch = nn.Sequential(*branch_layers)
+        # Branch network (shared)
+        self.branch = nn.Sequential(*build_mlp(3, self.fc_dim, self.n_layer, self.fc_dim))
 
-        # Trunk network with gated modulation
-        self.FC1u = nn.Linear(2, self.fc_dim)
-        self.FC2u = nn.Linear(self.fc_dim, self.fc_dim)
-        self.FC3u = nn.Linear(self.fc_dim, self.fc_dim)
+        # Trunk network, general for scalar / vector fields
+        # Use ModuleList to ensure parameters are registered
+        self.FC = nn.ModuleList([
+            nn.ModuleList(build_sequential_layers(2, self.fc_dim, 3))
+            for _ in range(field_dim)
+        ])
 
         # Activation
         self.act = nn.Tanh()
 
+    def _encode_par(self, par):
+        """Get the kernel encoding from branch network (shared across all field components).
+
+        Args:
+            par: Boundary parameters (B, N, 3)
+
+        Returns:
+            Max-pooled encoding (B, 1, F)
+        """
+        enc = self.branch(par)
+        return torch.amax(enc, 1, keepdim=True)
+
+    def _zip(self, xy, par, axis, enc=None):
+        """Get the kernel and predict field component at given axis.
+
+        Args:
+            xy: Concatenated coordinates (B, M, 2)
+            par: Boundary parameters (B, N, 3)
+            axis: Field component index
+            enc: Pre-computed encoding (optional). If None, will be computed.
+
+        Returns:
+            Field component values (B, M)
+        """
+        if enc is None:
+            enc = self._encode_par(par)
+        # Predict field component
+        return self._predict_head(xy, enc, *self.FC[axis])
+
 
 # ============================================================================
-# Darcy Flow Problem Models
+# Darcy Flow Problem Models, field_dim=1
 # ============================================================================
 
 class DeepONet_darcy(BaseDeepONet):
     """DeepONet for Darcy flow problem"""
+    def __init__(self, config, num_input_dim, hidden_block="linear"):
+        super().__init__(1, config, num_input_dim, hidden_block=hidden_block)
 
     def forward(self, x_coor, y_coor, par):
         '''
@@ -144,23 +320,19 @@ class DeepONet_darcy(BaseDeepONet):
                            N is the total number of BC points
 
         model output:
-            u (B, M): PDE solution fucntion values over the whole domain
+            u (B, M): scalar field values over the domain
         '''
-
-        # Only extract the function values information to represent the PDE parameters
-        enc = self.branch(par[...,-1])
-
-        # Compute the PDE solution prediction
         xy = torch.cat((x_coor.unsqueeze(-1), y_coor.unsqueeze(-1)), -1)
-        x = self.trunk(xy)    # (B,M,F)
-        u = torch.einsum('bij,bj->bi', x, enc)
-
+        u = self._zip(xy, par, 0)
         return u
 
 
 class Improved_DeepOnet_darcy(BaseImprovedDeepONet):
     """Improved DeepONet with embedding modulation for Darcy flow"""
 
+    def __init__(self, config, input_dim):
+        super().__init__(1, config, input_dim)
+
     def forward(self, x_coor, y_coor, par):
         '''
         model input:
@@ -170,9 +342,8 @@ class Improved_DeepOnet_darcy(BaseImprovedDeepONet):
                            N is the total number of BC points
 
         model output:
-            u (B, M): PDE solution fucntion values over the whole domain
+            u (B, M): scalar field values over the domain
         '''
-
         # Get the coordinates
         xy = torch.cat((x_coor.unsqueeze(-1), y_coor.unsqueeze(-1)), -1)
 
@@ -180,32 +351,18 @@ class Improved_DeepOnet_darcy(BaseImprovedDeepONet):
         par_emb = self.be(par[...,-1]).unsqueeze(1)
         coor_emb = self.ce(xy)
 
-        # Parameter forward
-        enc = self.FC1b(par[...,-1]).unsqueeze(1)
-        enc = self.act(enc)
-        enc = (1-enc) * par_emb + enc * coor_emb
-        enc = self.FC2b(enc)
-        enc = self.act(enc)
-        enc = (1-enc) * par_emb + enc * coor_emb
-        enc = self.FC3b(enc)
-
-        # Coordinate forward
-        xy = self.FC1c(xy)
-        xy = self.act(xy)
-        xy = (1-xy) * par_emb + xy * coor_emb
-        xy = self.FC2c(xy)
-        xy = self.act(xy)
-        xy = (1-xy) * par_emb + xy * coor_emb
-        xy = self.FC3c(xy)
-
-        # Combine
-        u = torch.sum(xy*enc, -1)
+        # Compute using the unified _zip method
+        u = self._zip(xy, par[...,-1].unsqueeze(1), par_emb, coor_emb, 0)
 
         return u
 
 
 class DCON_darcy(BaseDCON):
     """DCON for Darcy flow problem"""
+
+    def __init__(self, config):
+        super().__init__(1, config) # field_dim=1 for darcy / scalar-field
+
 
     def forward(self, x_coor, y_coor, par):
         '''
@@ -216,25 +373,13 @@ class DCON_darcy(BaseDCON):
                            N is the total number of BC points
 
         model output:
-            u (B, M): PDE solution fucntion values over the whole domain
+            u (B, M): scalar field values over the domain
         '''
-
-        # Get the kernel using both the coordinate and function values information
-        enc = self.branch(par)
-        enc = torch.amax(enc, 1, keepdim=True)
-
         # Concat coordinates
         xy = torch.cat((x_coor.unsqueeze(-1), y_coor.unsqueeze(-1)), -1)
 
-        # Predict u
-        u = self.FC1u(xy)
-        u = self.act(u)
-        u = u * enc
-        u = self.FC2u(u)
-        u = self.act(u)
-        u = u * enc
-        u = self.FC3u(u)
-        u = torch.mean(u * enc, -1)
+        # Compute using the unified _zip method
+        u = self._zip(xy, par, 0)
 
         return u
 
@@ -244,10 +389,8 @@ class New_model_darcy(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.fc = nn.Sequential(
-            nn.Linear(2,128), nn.Tanh(),
-            nn.Linear(128,1)
-        )
+        # Simple 1-layer MLP: 2 -> 128 -> 1
+        self.fc = nn.Sequential(*build_mlp(2, 128, 1, out_dim=1))
 
     def forward(self, x_coor, y_coor, par):
         '''
@@ -258,7 +401,7 @@ class New_model_darcy(nn.Module):
                            N is the total number of BC points
 
         model output:
-            u (B, M): PDE solution fucntion values over the whole domain
+            u (B, M): scalar field values over the domain
         '''
 
         u = self.fc(torch.cat((x_coor.unsqueeze(-1), y_coor.unsqueeze(-1)), -1)).squeeze(-1)
@@ -267,31 +410,13 @@ class New_model_darcy(nn.Module):
 
 
 # ============================================================================
-# Plate Stress Problem Models
+# Plate Stress Problem Models, field_dim=2
 # ============================================================================
 
 class DeepONet_plate(BaseDeepONet):
     """DeepONet for plate stress problem"""
-
-    def __init__(self, config, num_input_dim):
-        # Use fc layers for plate models (different from standard MLP)
-        super().__init__(config)
-
-        # Build branch networks (2 branches for u and v)
-        branch_layers = [nn.Linear(num_input_dim, self.fc_dim), nn.Tanh()]
-        for _ in range(self.n_layer - 1):
-            branch_layers.append(fc(self.fc_dim))
-        branch_layers.append(nn.Linear(self.fc_dim, self.fc_dim))
-        self.branch1 = nn.Sequential(*branch_layers)
-        self.branch2 = nn.Sequential(*branch_layers)
-
-        # Build trunk networks (2 trunks for u and v)
-        trunk_layers = [nn.Linear(2, self.fc_dim), nn.Tanh()]
-        for _ in range(self.n_layer - 1):
-            trunk_layers.append(fc(self.fc_dim))
-        trunk_layers.append(nn.Linear(self.fc_dim, self.fc_dim))
-        self.trunk1 = nn.Sequential(*trunk_layers)
-        self.trunk2 = nn.Sequential(*trunk_layers)
+    def __init__(self, config, num_input_dim, hidden_block="ff"):
+        super().__init__(2, config, num_input_dim, hidden_block=hidden_block)
 
     def forward(self, x_coor, y_coor, par):
         '''
@@ -302,21 +427,12 @@ class DeepONet_plate(BaseDeepONet):
                            N is the total number of BC points
 
         model output:
-            u (B, M): PDE solution fucntion values over the whole domain
-            v (B, M): PDE solution fucntion values over the whole domain
+            u (B, M): x-component of the vector field over the domain
+            v (B, M): y-component of the vector field over the domain
         '''
-
-        # PDE parameter encoding
-        enc1 = self.branch1(par[:,:,-1])
-        enc2 = self.branch2(par[:,:,-1])
-
-        # PDE solution prediction
         xy = torch.cat((x_coor.unsqueeze(-1), y_coor.unsqueeze(-1)), -1)
-        ux = self.trunk1(xy)
-        uy = self.trunk2(xy)
-        u = torch.einsum('bij,bj->bi', ux, enc1)
-        v = torch.einsum('bij,bj->bi', uy, enc2)
-
+        u = self._zip(xy, par, 0)
+        v = self._zip(xy, par, 1)
         return u, v
 
 
@@ -324,16 +440,7 @@ class Improved_DeepONet_plate(BaseImprovedDeepONet):
     """Improved DeepONet with embedding modulation for plate stress"""
 
     def __init__(self, config, num_input_dim):
-        super().__init__(config, num_input_dim)
-
-        # Additional trunk network for v displacement
-        self.FC1c1 = nn.Linear(2, self.fc_dim)
-        self.FC2c1 = nn.Linear(self.fc_dim, self.fc_dim)
-        self.FC3c1 = nn.Linear(self.fc_dim, self.fc_dim)
-
-        self.FC1c2 = nn.Linear(2, self.fc_dim)
-        self.FC2c2 = nn.Linear(self.fc_dim, self.fc_dim)
-        self.FC3c2 = nn.Linear(self.fc_dim, self.fc_dim)
+        super().__init__(2, config, num_input_dim)
 
     def forward(self, x_coor, y_coor, par):
         '''
@@ -344,10 +451,9 @@ class Improved_DeepONet_plate(BaseImprovedDeepONet):
                            N is the total number of BC points
 
         model output:
-            u (B, M): PDE solution fucntion values over the whole domain
-            v (B, M): PDE solution fucntion values over the whole domain
+            u (B, M): x-component of the vector field over the domain
+            v (B, M): y-component of the vector field over the domain
         '''
-
         # Get the coordinates
         xy = torch.cat((x_coor.unsqueeze(-1), y_coor.unsqueeze(-1)), -1)
 
@@ -355,65 +461,21 @@ class Improved_DeepONet_plate(BaseImprovedDeepONet):
         par_emb = self.be(par[...,-1]).unsqueeze(1)  # (B,1,F)
         coor_emb = self.ce(xy)  # (B, M, F)
 
-        # Parameter forward
-        enc = self.FC1b(par[...,-1]).unsqueeze(1)  # (B,F)
-        enc = self.act(enc)
-        enc = (1-enc) * par_emb + enc * coor_emb
-        enc = self.FC2b(enc)
-        enc = self.act(enc)
-        enc = (1-enc) * par_emb + enc * coor_emb
-        enc = self.FC3b(enc)
+        # Parameter forward (compute once, shared by both components)
+        enc = self._encode_par(par[...,-1].unsqueeze(1), par_emb, coor_emb)
 
-        # u coordinate forward
-        xy1 = self.FC1c1(xy)  # (B,M,F)
-        xy1 = self.act(xy1)
-        xy1 = (1-xy1) * par_emb + xy1 * coor_emb
-        xy1 = self.FC2c1(xy1)
-        xy1 = self.act(xy1)
-        xy1 = (1-xy1) * par_emb + xy1 * coor_emb
-        xy1 = self.FC3c1(xy1)
-        # Combine
-        u = torch.sum(xy1*enc, -1)  # (B,M)
-
-        # v coordinate forward
-        xy2 = self.FC1c2(xy)  # (B,M,F)
-        xy2 = self.act(xy2)
-        xy2 = (1-xy2) * par_emb + xy2 * coor_emb
-        xy2 = self.FC2c2(xy2)
-        xy2 = self.act(xy2)
-        xy2 = (1-xy2) * par_emb + xy2 * coor_emb
-        xy2 = self.FC3c2(xy2)
-        # Combine
-        v = torch.sum(xy2*enc, -1)  # (B,M)
+        # Compute u and v using the unified _zip method with shared encoding
+        u = self._zip(xy, par[...,-1].unsqueeze(1), par_emb, coor_emb, 0, enc)
+        v = self._zip(xy, par[...,-1].unsqueeze(1), par_emb, coor_emb, 1, enc)
 
         return u, v
 
 
-class DCON_plate(BaseNeuralOperator):
+class DCON_plate(BaseDCON):
     """DCON for plate stress problem"""
 
     def __init__(self, config):
-        super().__init__(config)
-
-        # Branch network
-        trunk_layers = build_mlp(3, self.fc_dim, self.n_layer, self.fc_dim)
-        self.branch = nn.Sequential(*trunk_layers)
-
-        # Lift layers (specific to plate model)
-        self.lift = nn.Linear(3, self.fc_dim)
-        self.val_lift = nn.Linear(1, self.fc_dim)
-
-        # Trunk network 1 (for u)
-        self.FC1u = nn.Linear(2, self.fc_dim)
-        self.FC2u = nn.Linear(self.fc_dim, self.fc_dim)
-        self.FC3u = nn.Linear(self.fc_dim, self.fc_dim)
-
-        # Trunk network 2 (for v)
-        self.FC1v = nn.Linear(2, self.fc_dim)
-        self.FC2v = nn.Linear(self.fc_dim, self.fc_dim)
-        self.FC3v = nn.Linear(self.fc_dim, self.fc_dim)
-
-        self.act = nn.Tanh()
+        super().__init__(2, config) # field_dim=2 for plate / vector-field
 
     def forward(self, x_coor, y_coor, par):
         '''
@@ -424,36 +486,18 @@ class DCON_plate(BaseNeuralOperator):
                            N is the total number of BC points
 
         model output:
-            u (B, M): PDE solution fucntion values over the whole domain
-            v (B, M): PDE solution fucntion values over the whole domain
+            u (B, M): x-component of the vector field over the domain
+            v (B, M): y-component of the vector field over the domain
         '''
-
-        # Get the kernel
-        enc = self.branch(par)
-        enc = torch.amax(enc, 1, keepdim=True)
+        # Get the kernel (compute once, shared by both components)
+        enc = self._encode_par(par)
 
         # Concat coordinates
         xy = torch.cat((x_coor.unsqueeze(-1), y_coor.unsqueeze(-1)), -1)
 
-        # Predict u
-        u = self.FC1u(xy)
-        u = self.act(u)
-        u = u * enc
-        u = self.FC2u(u)
-        u = self.act(u)
-        u = u * enc
-        u = self.FC3u(u)
-        u = torch.mean(u * enc, -1)  # (B, M)
-
-        # Predict v
-        v = self.FC1v(xy)
-        v = self.act(v)
-        v = v * enc
-        v = self.FC2v(v)
-        v = self.act(v)
-        v = v * enc
-        v = self.FC3v(v)
-        v = torch.mean(v * enc, -1)  # (B, M)
+        # Predict field components using the unified _zip method with shared encoding
+        u = self._zip(xy, par, 0, enc)
+        v = self._zip(xy, par, 1, enc)
 
         return u, v
 
@@ -463,14 +507,9 @@ class New_model_plate(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.fc1 = nn.Sequential(
-            nn.Linear(2,128), nn.Tanh(),
-            nn.Linear(128,1)
-        )
-        self.fc2 = nn.Sequential(
-            nn.Linear(2,128), nn.Tanh(),
-            nn.Linear(128,1)
-        )
+        # Simple 1-layer MLPs: 2 -> 128 -> 1
+        self.fc1 = nn.Sequential(*build_mlp(2, 128, 1, out_dim=1))
+        self.fc2 = nn.Sequential(*build_mlp(2, 128, 1, out_dim=1))
 
     def forward(self, x_coor, y_coor, par):
         '''
@@ -481,8 +520,8 @@ class New_model_plate(nn.Module):
                            N is the total number of BC points
 
         model output:
-            u (B, M): PDE solution fucntion values over the whole domain
-            v (B, M): PDE solution fucntion values over the whole domain
+            u (B, M): x-component of the vector field over the domain
+            v (B, M): y-component of the vector field over the domain
         '''
 
         u = self.fc1(torch.cat((x_coor.unsqueeze(-1), y_coor.unsqueeze(-1)), -1)).squeeze(-1)
