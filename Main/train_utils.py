@@ -17,6 +17,20 @@ def print_training_config(config):
     print('coordinate sampling frequency:', config['train']['coor_sampling_freq'])
     print('learning rate:', config['train']['base_lr'])
     print('BC weight', config['train']['bc_weight'])
+    
+    # Print GradNorm configuration if present
+    gradnorm_config = config.get('train', {}).get('gradnorm', {})
+    if gradnorm_config.get('enabled', False):
+        use_simple = gradnorm_config.get('use_simple', False)
+        print('GradNorm enabled: True')
+        print('  mode:', 'Simple (loss-ratio)' if use_simple else 'Full (gradient-based)')
+        print('  alpha:', gradnorm_config.get('alpha', 1.5))
+        if use_simple:
+            print('  window_size:', gradnorm_config.get('window_size', 50))
+        else:
+            print('  lr_weights:', gradnorm_config.get('lr_weights', 0.025))
+    else:
+        print('GradNorm enabled: False')
 
 
 def setup_optimizer_and_loss(config, model):
@@ -90,10 +104,10 @@ def validate_and_save_model_generic(model, val_loader, coors, device, args, epoc
 
         print('Best L2 relative error:', err)
 
-        # Print all accumulated losses
+        # Print all accumulated losses (unweighted true values)
         for key, value in avg_losses.items():
             if value != 0:  # Only print non-zero losses
-                print(f'current period {key} loss:', value / vf)
+                print(f'current period {key} loss (unweighted):', value / vf)
 
         # Save model if improved
         if err < min_val_err:

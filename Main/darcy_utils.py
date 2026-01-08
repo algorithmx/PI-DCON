@@ -11,6 +11,12 @@ from train_utils import (
     try_load_pretrained_model,
     validate_and_save_model_generic
 )
+from gradnorm import (
+    GradNorm,
+    GradNormSimple,
+    create_gradnorm,
+    get_shared_layer
+)
 
 # Define physics-informed loss loss
 def darcy_loss(u, x_coor, y_coor):
@@ -152,9 +158,14 @@ def sample_pde_coordinates_darcy(pde_coors, num_pde_nodes, sampling_size):
 
 
 def train_single_iteration_darcy(model, par, out, prepared_coords, BC_flags, mse,
-                                 bc_weight, optimizer, device, coor_sampling_size):
+                                 bc_weight, optimizer, device, coor_sampling_size,
+                                 gradnorm=None, shared_layer=None):
     """
     Perform a single training iteration for Darcy flow.
+
+    Args:
+        gradnorm: Optional GradNorm or GradNormSimple instance for adaptive loss weighting
+        shared_layer: Optional shared layer for full GradNorm (required for GradNorm, not for GradNormSimple)
 
     Returns:
         dict: Loss values for this iteration
@@ -183,20 +194,36 @@ def train_single_iteration_darcy(model, par, out, prepared_coords, BC_flags, mse
     # Forward pass for PDE
     u_pred = model(sampled_x_coors, sampled_y_coors, par)
 
-    # Compute losses
+    # Compute individual losses
     pde_loss = darcy_loss(u_pred, sampled_x_coors, sampled_y_coors)
     bc_loss = mse(BC_pred, BC_gt)
-    total_loss = pde_loss + bc_weight * bc_loss
-
-    # Backward pass and optimization
-    optimizer.zero_grad()
-    total_loss.backward()
-    optimizer.step()
+    
+    # Apply GradNorm or fixed weights
+    if isinstance(gradnorm, GradNorm):
+        # Full GradNorm algorithm (paper-faithful)
+        # GradNorm handles its own backward pass and weight updates
+        gradnorm.step([pde_loss, bc_loss], shared_layer, optimizer)
+        # Compute weighted loss for logging (no backward needed)
+        with torch.no_grad():
+            weights = gradnorm.get_weights()
+            total_loss = (weights * torch.stack([pde_loss, bc_loss])).sum()
+    elif isinstance(gradnorm, GradNormSimple):
+        # Simplified GradNorm (gradient-free heuristic)
+        total_loss = gradnorm.update_and_get_weighted_loss([pde_loss, bc_loss])
+        optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
+    else:
+        # Use fixed bc_weight
+        total_loss = pde_loss + bc_weight * bc_loss
+        optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
 
     return {
         'pde': pde_loss.detach().cpu().item(),
         'bc': bc_loss.detach().cpu().item(),
-        'total': total_loss
+        'total': total_loss.detach().cpu().item() if isinstance(total_loss, torch.Tensor) else total_loss
     }
 
 
@@ -249,6 +276,12 @@ def train(args, config, model, device, loaders, coors, BC_flags):
     # define training weight
     bc_weight = config['train']['bc_weight']
 
+    # setup GradNorm if enabled (2 tasks: pde_loss, bc_loss)
+    gradnorm = create_gradnorm(num_tasks=2, config=config, device=device)
+    
+    # Get shared layer for full GradNorm algorithm
+    shared_layer = get_shared_layer(model) if isinstance(gradnorm, GradNorm) else None
+
     # start the training
     if args.phase == 'train':
         min_val_err = np.inf
@@ -263,6 +296,10 @@ def train(args, config, model, device, loaders, coors, BC_flags):
 
             # train one epoch
             model.train()
+            epoch_pde_loss = 0
+            epoch_bc_loss = 0
+            num_iterations = 0
+            
             for (par, out) in train_loader:
 
                 for _ in range(config['train']['coor_sampling_freq']):
@@ -270,19 +307,31 @@ def train(args, config, model, device, loaders, coors, BC_flags):
                     # perform single training iteration
                     losses = train_single_iteration_darcy(
                         model, par, out, prepared_coords, BC_flags, mse,
-                        bc_weight, optimizer, device, config['train']['coor_sampling_size']
+                        bc_weight, optimizer, device, config['train']['coor_sampling_size'],
+                        gradnorm=gradnorm, shared_layer=shared_layer
                     )
 
-                    # accumulate losses
+                    # accumulate losses for this epoch
+                    epoch_pde_loss += losses['pde']
+                    epoch_bc_loss += losses['bc']
+                    num_iterations += 1
+                    
+                    # accumulate losses for validation period
                     avg_losses['pde'] += losses['pde']
                     avg_losses['bc'] += losses['bc']
 
-            # Update progress bar with current losses
+            # Update progress bar with current epoch average losses (unweighted true values)
             pbar.set_description(f'Epoch {e}')
-            pbar.set_postfix({
-                'PDE': f"{avg_losses['pde']:.6f}",
-                'BC': f"{avg_losses['bc']:.6f}"
-            })
+            postfix_dict = {
+                'PDE(raw)': f"{epoch_pde_loss / num_iterations:.6f}",
+                'BC(raw)': f"{epoch_bc_loss / num_iterations:.6f}"
+            }
+            # Show GradNorm weights if enabled
+            if gradnorm is not None:
+                weights = gradnorm.get_weights_list()
+                postfix_dict['w_pde'] = f"{weights[0]:.2f}"
+                postfix_dict['w_bc'] = f"{weights[1]:.2f}"
+            pbar.set_postfix(postfix_dict)
 
     # final test
     model.load_state_dict(torch.load(

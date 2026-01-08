@@ -238,11 +238,40 @@ class DCONBlendMixin(BlendMixin):
         x = self._linear_act(linear, x)
         return self._blend(x, enc)
 
-    def _predict_head(self, inp, enc, fc1, fc2, fc3):
-        x = self._linear_act_blend(fc1, inp, enc)
-        x = self._linear_act_blend(fc2, x, enc)
-        x = fc3(x)
-        return torch.mean(self._blend(x, enc), -1)
+    def _predict_head(self, inp, enc, fcs, *, final_gate=True, reduce_mean=True, gate_layers=None):
+        """Apply gated-modulation trunk head.
+
+        Matches the PI-GANO `DCONBlendMixin` signature, while preserving
+        PI-DCON behavior when called with the default arguments.
+
+        Args:
+            inp: (B, M, Din)
+            enc: (B, 1, F)
+            fcs: sequence of Linear layers, length >= 2
+            final_gate: if True, apply a final multiplicative gate with `enc`
+            gate_layers: controls which intermediate layers apply the gate.
+                - None: gate after every pre-final layer (default)
+                - int k: gate only after the first k pre-final layers
+            reduce_mean: if True, return mean over feature dim (B, M)
+        """
+        if len(fcs) < 2:
+            raise ValueError(f"fcs must have >=2 layers, got {len(fcs)}")
+
+        if gate_layers is None:
+            gate_layers = len(fcs) - 1
+
+        x = inp
+        for idx, fc in enumerate(fcs[:-1]):
+            x = self._linear_act(fc, x)
+            if idx < gate_layers:
+                x = self._blend(x, enc)
+
+        x = fcs[-1](x)
+        if final_gate:
+            x = self._blend(x, enc)
+        if reduce_mean:
+            return torch.mean(x, -1)
+        return x
 
 
 class BaseDCON(DCONBlendMixin, BaseNeuralOperator):
@@ -253,14 +282,18 @@ class BaseDCON(DCONBlendMixin, BaseNeuralOperator):
     def __init__(
         self,
         field_dim,
-        config
+        config,
+        par_dim=3,
     ):
         super().__init__(config)
         if field_dim not in (1, 2):
             raise ValueError(f"field_dim must be 1 or 2, got {field_dim}")
 
+        self.field_dim = field_dim
+        self.par_dim = par_dim
+
         # Branch network (shared)
-        self.branch = nn.Sequential(*build_mlp(3, self.fc_dim, self.n_layer, self.fc_dim))
+        self.branch = nn.Sequential(*build_mlp(par_dim, self.fc_dim, self.n_layer, self.fc_dim))
 
         # Trunk network, general for scalar / vector fields
         # Use ModuleList to ensure parameters are registered
@@ -272,34 +305,38 @@ class BaseDCON(DCONBlendMixin, BaseNeuralOperator):
         # Activation
         self.act = nn.Tanh()
 
-    def _encode_par(self, par):
+    def _encode_par(self, par, par_flag=None):
         """Get the kernel encoding from branch network (shared across all field components).
 
         Args:
-            par: Boundary parameters (B, N, 3)
+            par: Boundary parameters (B, N, par_dim)
+            par_flag: Optional valid flags (B, N). If provided, masked max-pooling is used.
 
         Returns:
             Max-pooled encoding (B, 1, F)
         """
         enc = self.branch(par)
+        if par_flag is not None:
+            enc = enc * par_flag.unsqueeze(-1)
         return torch.amax(enc, 1, keepdim=True)
 
-    def _zip(self, xy, par, axis, enc=None):
+    def _zip(self, xy, par, axis=0, enc=None, par_flag=None):
         """Get the kernel and predict field component at given axis.
 
         Args:
             xy: Concatenated coordinates (B, M, 2)
-            par: Boundary parameters (B, N, 3)
+            par: Boundary parameters (B, N, par_dim)
             axis: Field component index
             enc: Pre-computed encoding (optional). If None, will be computed.
+            par_flag: Optional valid flags (B, N). If provided, masked max-pooling is used.
 
         Returns:
             Field component values (B, M)
         """
         if enc is None:
-            enc = self._encode_par(par)
+            enc = self._encode_par(par, par_flag)
         # Predict field component
-        return self._predict_head(xy, enc, *self.FC[axis])
+        return self._predict_head(xy, enc, self.FC[axis])
 
 
 # ============================================================================

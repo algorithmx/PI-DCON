@@ -12,6 +12,12 @@ from train_utils import (
     try_load_pretrained_model,
     validate_and_save_model_generic
 )
+from gradnorm import (
+    GradNorm,
+    GradNormSimple,
+    create_gradnorm,
+    get_shared_layer
+)
 
 
 # Physics-informed loss
@@ -188,9 +194,15 @@ def prepare_training_coordinates(coors, flag_BCxy, flag_BCy, flag_BC_load, devic
 
 def compute_all_losses(u_load_pred, v_load_pred, u_load_gt, v_load_gt,
                       u_BCxy_pred, v_BCxy_pred, sigma_yy, sigma_xy,
-                      rx_pde, ry_pde, mse, weight_bc):
+                      rx_pde, ry_pde, mse, weight_bc, gradnorm=None,
+                      shared_layer=None, optimizer=None):
     """
     Compute all loss components for training.
+
+    Args:
+        gradnorm: Optional GradNorm or GradNormSimple instance for adaptive loss weighting
+        shared_layer: Optional shared layer for full GradNorm (required for GradNorm)
+        optimizer: Optional model optimizer for full GradNorm (required for GradNorm)
 
     Returns:
         dict: Dictionary containing all loss components
@@ -201,7 +213,24 @@ def compute_all_losses(u_load_pred, v_load_pred, u_load_gt, v_load_gt,
     bc_loss4 = torch.mean(sigma_yy**2) + torch.mean(sigma_xy**2)
     pde_loss1 = torch.mean(rx_pde**2)
     pde_loss2 = torch.mean(ry_pde**2)
-    total_loss = (bc_loss1 + bc_loss2 + bc_loss3 + bc_loss4) + (pde_loss1 + pde_loss2) * weight_bc
+    
+    all_losses = [bc_loss1, bc_loss2, bc_loss3, bc_loss4, pde_loss1, pde_loss2]
+    
+    # Compute total loss with GradNorm or fixed weights
+    if isinstance(gradnorm, GradNorm):
+        # Full GradNorm algorithm (paper-faithful)
+        # GradNorm handles its own backward pass and weight updates
+        gradnorm.step(all_losses, shared_layer, optimizer)
+        # Compute weighted loss for logging (no backward needed)
+        with torch.no_grad():
+            weights = gradnorm.get_weights()
+            total_loss = (weights * torch.stack(all_losses)).sum()
+    elif isinstance(gradnorm, GradNormSimple):
+        # Simplified GradNorm (gradient-free heuristic)
+        total_loss = gradnorm.update_and_get_weighted_loss(all_losses)
+    else:
+        # Use fixed weight_bc
+        total_loss = (bc_loss1 + bc_loss2 + bc_loss3 + bc_loss4) + (pde_loss1 + pde_loss2) * weight_bc
 
     return {
         'bc1': bc_loss1.detach().cpu().item(),
@@ -210,7 +239,8 @@ def compute_all_losses(u_load_pred, v_load_pred, u_load_gt, v_load_gt,
         'bc4': bc_loss4.detach().cpu().item(),
         'pde1': pde_loss1.detach().cpu().item(),
         'pde2': pde_loss2.detach().cpu().item(),
-        'total': total_loss
+        'total': total_loss,
+        'uses_full_gradnorm': isinstance(gradnorm, GradNorm)
     }
 
 
@@ -233,9 +263,14 @@ def sample_pde_coordinates(pde_coors, num_pde_nodes, pointwise_err, flags, confi
 
 
 def train_single_iteration(model, par, u, v, prepared_coords, params, mse, weight_bc,
-                          optimizer, pointwise_err, flags, config):
+                          optimizer, pointwise_err, flags, config, gradnorm=None,
+                          shared_layer=None):
     """
     Perform a single training iteration with coordinate sampling.
+
+    Args:
+        gradnorm: Optional GradNorm or GradNormSimple instance for adaptive loss weighting
+        shared_layer: Optional shared layer for full GradNorm (required for GradNorm)
 
     Returns:
         dict: Loss values for this iteration
@@ -284,13 +319,15 @@ def train_single_iteration(model, par, u, v, prepared_coords, params, mse, weigh
     losses = compute_all_losses(
         u_load_pred, v_load_pred, u_load_gt, v_load_gt,
         u_BCxy_pred, v_BCxy_pred, sigma_yy, sigma_xy,
-        rx_pde, ry_pde, mse, weight_bc
+        rx_pde, ry_pde, mse, weight_bc, gradnorm=gradnorm,
+        shared_layer=shared_layer, optimizer=optimizer
     )
 
-    # Backward pass and optimization
-    optimizer.zero_grad()
-    losses['total'].backward()
-    optimizer.step()
+    # Backward pass and optimization (unless full GradNorm already did it)
+    if not losses.get('uses_full_gradnorm', False):
+        optimizer.zero_grad()
+        losses['total'].backward()
+        optimizer.step()
 
     return losses
 
@@ -339,6 +376,12 @@ def train(args, config, model, device, loaders, coors, flag_BCxy, flag_BCy, flag
         'BCy': flag_BCy
     }
 
+    # setup GradNorm if enabled (6 tasks: bc1, bc2, bc3, bc4, pde1, pde2)
+    gradnorm = create_gradnorm(num_tasks=6, config=config, device=device)
+    
+    # Get shared layer for full GradNorm algorithm
+    shared_layer = get_shared_layer(model) if isinstance(gradnorm, GradNorm) else None
+
     # start the training
     if args.phase == 'train':
         min_val_err = np.inf
@@ -354,6 +397,12 @@ def train(args, config, model, device, loaders, coors, flag_BCxy, flag_BCy, flag
 
             # train one epoch
             model.train()
+            epoch_losses = {
+                'bc1': 0, 'bc2': 0, 'bc3': 0, 'bc4': 0,
+                'pde1': 0, 'pde2': 0
+            }
+            num_iterations = 0
+            
             for (par, u, v) in train_loader:
 
                 for _ in range(config['train']['coor_sampling_freq']):
@@ -361,10 +410,16 @@ def train(args, config, model, device, loaders, coors, flag_BCxy, flag_BCy, flag
                     # perform single training iteration
                     losses = train_single_iteration(
                         model, par, u, v, prepared_coords, params, mse, weight_bc,
-                        optimizer, pointwise_err, flags, config
+                        optimizer, pointwise_err, flags, config, gradnorm=gradnorm,
+                        shared_layer=shared_layer
                     )
 
-                    # accumulate losses
+                    # accumulate losses for this epoch
+                    for key in epoch_losses:
+                        epoch_losses[key] += losses[key]
+                    num_iterations += 1
+                    
+                    # accumulate losses for validation period
                     avg_losses['bc1'] += losses['bc1']
                     avg_losses['bc2'] += losses['bc2']
                     avg_losses['bc3'] += losses['bc3']
@@ -372,12 +427,18 @@ def train(args, config, model, device, loaders, coors, flag_BCxy, flag_BCy, flag
                     avg_losses['pde1'] += losses['pde1']
                     avg_losses['pde2'] += losses['pde2']
 
-            # Update progress bar with current losses
+            # Update progress bar with current epoch average losses (unweighted true values)
             pbar.set_description(f'Epoch {e}')
-            pbar.set_postfix({
-                'PDE': f"{avg_losses['pde1'] + avg_losses['pde2']:.6f}",
-                'BC': f"{avg_losses['bc1'] + avg_losses['bc2'] + avg_losses['bc3'] + avg_losses['bc4']:.6f}"
-            })
+            postfix_dict = {
+                'PDE(raw)': f"{(epoch_losses['pde1'] + epoch_losses['pde2']) / num_iterations:.6f}",
+                'BC(raw)': f"{(epoch_losses['bc1'] + epoch_losses['bc2'] + epoch_losses['bc3'] + epoch_losses['bc4']) / num_iterations:.6f}"
+            }
+            # Show GradNorm weights if enabled (show aggregated BC and PDE weights)
+            if gradnorm is not None:
+                weights = gradnorm.get_weights_list()
+                postfix_dict['w_bc'] = f"{sum(weights[:4]):.2f}"
+                postfix_dict['w_pde'] = f"{sum(weights[4:]):.2f}"
+            pbar.set_postfix(postfix_dict)
 
     # final test
     model.load_state_dict(torch.load(
