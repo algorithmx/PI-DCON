@@ -12,9 +12,10 @@ PI-DCON is the official implementation of "Physics-informed discretization-indep
 
 ## Common Commands
 
-### Installation
+### Environment
+
 ```bash
-pip install -r requirements.txt
+conda activate ml_env
 ```
 
 ### Training (Darcy flow problem)
@@ -58,6 +59,7 @@ python exp_pinn_plate.py --model='DCON' --phase='test'
   - `DCON_darcy` / `DCON_plate` - Proposed DCON model
   - `New_model_darcy` / `New_model_plate` - Template for custom models
 
+- `Main/models.bak.py` - Neural network model original (un-optimized, un-refactored) implementations
 - `Main/data.py` - Data loading and preprocessing (MATLAB .mat files)
 - `Main/darcy_utils.py` - Training utilities for Darcy flow problem
 - `Main/plate_utils.py` - Training utilities for plate stress problem
